@@ -45,6 +45,11 @@ enum Commands {
         /// Nickname to look up (defaults to your own account if omitted, requires login)
         user: Option<String>,
     },
+    /// List unsolved challenges in your current class for a category (requires login)
+    Class {
+        /// pwnable, reversing, web, or crypto
+        category: String,
+    },
 }
 
 #[tokio::main]
@@ -61,8 +66,7 @@ async fn main() -> Result<()> {
             println!("{}", "Logged out successfully!".green());
         }
         Commands::Me => {
-            let user_info = api::get_user_info().await?;
-            println!("{}", format!("User: {}", user_info).cyan());
+            print_me().await?;
         }
         Commands::Challenges { category, search } => {
             print_challenges(category.as_deref(), search.as_deref()).await?;
@@ -76,6 +80,82 @@ async fn main() -> Result<()> {
         Commands::Stat { user } => {
             print_stat(user.as_deref()).await?;
         }
+        Commands::Class { category } => {
+            print_class(&category).await?;
+        }
+    }
+
+    Ok(())
+}
+
+const CLASS_CATEGORIES: [&str; 4] = ["pwnable", "reversing", "web", "crypto"];
+
+async fn print_me() -> Result<()> {
+    let user_info = api::get_user_info().await?;
+    println!("{}", format!("User: {}", user_info).cyan());
+
+    let tracked = api::get_tracked_classes().await?;
+    println!("\n{}", "Class progress".yellow().bold());
+    for c in &tracked.categories {
+        match &c.tracked_class {
+            Some(tc) => println!(
+                "  {:<10} level {}  ({}/{} solved) - {}",
+                c.category, tc.level, tc.cnt_completed, tc.cnt_challenges, tc.description
+            ),
+            None => println!("  {:<10} all levels completed", c.category),
+        }
+    }
+
+    Ok(())
+}
+
+async fn print_class(category: &str) -> Result<()> {
+    if !CLASS_CATEGORIES.contains(&category) {
+        return Err(anyhow::anyhow!(
+            "Unknown category '{}' - expected one of: {}",
+            category,
+            CLASS_CATEGORIES.join(", ")
+        ));
+    }
+
+    let tracked = api::get_tracked_classes().await?;
+    let track = tracked
+        .categories
+        .into_iter()
+        .find(|c| c.category == category)
+        .ok_or_else(|| anyhow::anyhow!("No class track found for '{}'", category))?;
+
+    let Some(tc) = track.tracked_class else {
+        println!(
+            "{}",
+            format!("✓ You've completed every class level in {}!", category).green().bold()
+        );
+        return Ok(());
+    };
+
+    println!(
+        "{}",
+        format!("{} level {} - {}", category, tc.level, tc.description).cyan().bold()
+    );
+    println!("{}\n", format!("{}/{} solved so far", tc.cnt_completed, tc.cnt_challenges).dimmed());
+
+    let challenges = api::get_class_challenges(category, tc.level).await?;
+    let unsolved: Vec<_> = challenges.iter().filter(|c| !c.is_completed).collect();
+
+    if unsolved.is_empty() {
+        println!("{}", "No unsolved challenges left in this class!".green());
+        return Ok(());
+    }
+
+    println!("{}", format!("Unsolved ({}):", unsolved.len()).yellow().bold());
+    for c in unsolved {
+        println!(
+            "  {} {}  [{}]  {}",
+            format!("#{}", c.id).dimmed(),
+            c.title,
+            c.tier_display,
+            format!("solved by {}", c.cnt_solvers).dimmed()
+        );
     }
 
     Ok(())

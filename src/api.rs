@@ -308,6 +308,83 @@ pub async fn get_tier_progress(user_id: i64) -> Result<TierProgress> {
     Ok(response.json().await?)
 }
 
+// Real schema confirmed against the live API (class.har, captured on the
+// class-tracker page). GET /api/v1/wargame/classes/tracked/ works without
+// auth (returns all-zero progress anonymously) but personalizes with the
+// session cookie, same pattern as challenge listings. `tracked_class` is
+// the next incomplete level in that category - None once every level is
+// finished.
+#[derive(Debug, Deserialize)]
+pub struct ClassTierBreakdown {
+    pub tier: i32,
+    pub completed: i32,
+    pub total: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrackedClass {
+    pub category: String,
+    pub level: i32,
+    pub description: String,
+    pub cnt_challenges: i32,
+    pub cnt_completed: i32,
+    pub tier_breakdown: Vec<ClassTierBreakdown>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CategoryTrack {
+    pub category: String,
+    pub owned_level: i32,
+    pub tracked_class: Option<TrackedClass>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrackedClasses {
+    pub categories: Vec<CategoryTrack>,
+}
+
+pub async fn get_tracked_classes() -> Result<TrackedClasses> {
+    let client = client()?;
+
+    let request = client
+        .get(format!("{}/api/v1/wargame/classes/tracked/", DREAMHACK_BASE_URL))
+        .header("Accept", "application/json");
+
+    let response = with_optional_session(request)?.send().await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Failed to get class progress: {}", response.status()));
+    }
+
+    Ok(response.json().await?)
+}
+
+// GET /api/v1/wargame/classes/{category}-{level}/challenges/ - confirmed
+// public (no auth) via curl, same Challenge shape as the main wargame list.
+pub async fn get_class_challenges(category: &str, level: i32) -> Result<Vec<Challenge>> {
+    let client = client()?;
+
+    let request = client
+        .get(format!(
+            "{}/api/v1/wargame/classes/{}-{}/challenges/",
+            DREAMHACK_BASE_URL, category, level
+        ))
+        .header("Accept", "application/json");
+
+    let response = with_optional_session(request)?.send().await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "Failed to get challenges for class {}-{}: {}",
+            category,
+            level,
+            response.status()
+        ));
+    }
+
+    Ok(response.json().await?)
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorDetail {
     detail: String,
