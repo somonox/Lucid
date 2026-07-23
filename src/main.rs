@@ -113,7 +113,7 @@ async fn submit_flag(challenge_id: i64, flag: &str) -> Result<()> {
 /// container exists - a solved flag shouldn't fail just because there was
 /// nothing running to stop.
 fn stop_docker_container(tag: &str) {
-    if std::process::Command::new("docker").arg("--version").output().is_err() {
+    if docker_unavailable_reason().is_some() {
         return;
     }
 
@@ -296,19 +296,53 @@ fn find_dockerfile(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     subdirs.into_iter().find_map(|d| find_dockerfile(&d))
 }
 
+/// `docker --version` succeeds even when the daemon socket is unreachable
+/// (it only talks to the client binary), so it can't predict whether
+/// `docker build`/`run` will actually work. `docker info` requires a live
+/// daemon connection, so it surfaces permission/daemon-down problems
+/// upfront instead of mid-build behind a wall of unrelated tar/pipe
+/// errors - confirmed against a real run: `docker --version` passed, then
+/// `docker build` failed deep into tar streaming with "permission denied
+/// ... docker.sock" buried in the middle of the noise.
+fn docker_unavailable_reason() -> Option<String> {
+    match std::process::Command::new("docker").arg("info").output() {
+        Err(_) => Some("'docker' isn't installed".to_string()),
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("permission denied") && stderr.contains("docker.sock") {
+                Some(
+                    "permission denied talking to the Docker daemon - your user likely isn't \
+                     in the 'docker' group. Try: sudo usermod -aG docker $USER, then log out \
+                     and back in (or run `newgrp docker`)."
+                        .to_string(),
+                )
+            } else {
+                Some(format!("docker daemon not reachable: {}", stderr.trim()))
+            }
+        }
+    }
+}
+
+/// Echoes docker's own stdout/stderr so nothing is hidden even though we
+/// captured it (needed to check exit status ourselves rather than just
+/// inheriting the child's stdio).
+fn print_docker_output(output: &std::process::Output) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(&output.stdout);
+    let _ = std::io::stderr().write_all(&output.stderr);
+}
+
 fn build_and_run_docker(dockerfile: &std::path::Path, challenge_id: i64, title: &str) -> Result<()> {
     let build_context = dockerfile
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Dockerfile has no parent directory"))?;
 
-    if std::process::Command::new("docker")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if let Some(reason) = docker_unavailable_reason() {
         println!(
             "{}",
-            "Dockerfile found but 'docker' isn't installed - skipping container build.".yellow()
+            format!("Dockerfile found but Docker isn't usable ({reason}) - skipping container build.")
+                .yellow()
         );
         return Ok(());
     }
@@ -316,12 +350,13 @@ fn build_and_run_docker(dockerfile: &std::path::Path, challenge_id: i64, title: 
     let tag = docker_tag_for_challenge(challenge_id, title);
 
     println!("\nDockerfile found - building image '{}'...", tag);
-    let build_status = std::process::Command::new("docker")
+    let build_output = std::process::Command::new("docker")
         .args(["build", "-t", &tag, "."])
         .current_dir(build_context)
-        .status()?;
-    if !build_status.success() {
-        return Err(anyhow::anyhow!("docker build exited with {}", build_status));
+        .output()?;
+    print_docker_output(&build_output);
+    if !build_output.status.success() {
+        return Err(anyhow::anyhow!("docker build exited with {}", build_output.status));
     }
 
     // Ignore failures here - there's just nothing to remove on a first run.
@@ -330,11 +365,12 @@ fn build_and_run_docker(dockerfile: &std::path::Path, challenge_id: i64, title: 
         .output();
 
     println!("Starting container '{}'...", tag);
-    let run_status = std::process::Command::new("docker")
+    let run_output = std::process::Command::new("docker")
         .args(["run", "-d", "-P", "--name", &tag, &tag])
-        .status()?;
-    if !run_status.success() {
-        return Err(anyhow::anyhow!("docker run exited with {}", run_status));
+        .output()?;
+    print_docker_output(&run_output);
+    if !run_output.status.success() {
+        return Err(anyhow::anyhow!("docker run exited with {}", run_output.status));
     }
 
     let ports = std::process::Command::new("docker")
