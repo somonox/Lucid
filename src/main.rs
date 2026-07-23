@@ -50,6 +50,12 @@ enum Commands {
         /// pwnable, reversing, web, or crypto
         category: String,
     },
+    /// Submit a flag for a challenge (requires login). Stops any container
+    /// 'lucid download' started for it if the flag is correct.
+    Submit {
+        challenge_id: i64,
+        flag: String,
+    },
 }
 
 #[tokio::main]
@@ -83,9 +89,39 @@ async fn main() -> Result<()> {
         Commands::Class { category } => {
             print_class(&category).await?;
         }
+        Commands::Submit { challenge_id, flag } => {
+            submit_flag(challenge_id, &flag).await?;
+        }
     }
 
     Ok(())
+}
+
+async fn submit_flag(challenge_id: i64, flag: &str) -> Result<()> {
+    println!("Submitting flag for challenge #{}...", challenge_id);
+    api::submit_flag(challenge_id, flag).await?;
+    println!("{}", "✓ Correct flag!".green().bold());
+
+    let challenge = api::get_challenge(challenge_id).await?;
+    stop_docker_container(&docker_tag_for_challenge(challenge_id, &challenge.title));
+
+    Ok(())
+}
+
+/// Best-effort teardown of whatever container `lucid download` started for
+/// this challenge. Silent no-op if docker isn't installed or no such
+/// container exists - a solved flag shouldn't fail just because there was
+/// nothing running to stop.
+fn stop_docker_container(tag: &str) {
+    if std::process::Command::new("docker").arg("--version").output().is_err() {
+        return;
+    }
+
+    if let Ok(output) = std::process::Command::new("docker").args(["rm", "-f", tag]).output() {
+        if output.status.success() {
+            println!("{}", format!("✓ Stopped container '{}'", tag).green());
+        }
+    }
 }
 
 const CLASS_CATEGORIES: [&str; 4] = ["pwnable", "reversing", "web", "crypto"];
@@ -183,12 +219,23 @@ async fn download_challenge(challenge_id: i64, output: Option<&str>) -> Result<(
 
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut out_file = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut entry, &mut out_file)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Buffered (rather than streamed via io::copy) so we can sniff the
+        // first bytes for an ELF/shebang executable before writing - the
+        // zip crate doesn't restore the original Unix permission bits, so
+        // extracted binaries otherwise land as non-executable (confirmed:
+        // a downloaded ELF challenge binary came out `-rw-r--r--`).
+        let mut contents = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut contents)?;
+        std::fs::write(&out_path, &contents)?;
+        if is_executable(&contents) {
+            make_executable(&out_path)?;
         }
     }
 
@@ -204,7 +251,133 @@ async fn download_challenge(challenge_id: i64, output: Option<&str>) -> Result<(
         .bold()
     );
 
+    if let Some(dockerfile) = find_dockerfile(folder) {
+        if let Err(e) = build_and_run_docker(&dockerfile, challenge.id, &challenge.title) {
+            println!("{}", format!("⚠ Dockerfile found but container setup failed: {e}").yellow());
+        }
+    }
+
     Ok(())
+}
+
+fn is_executable(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x7fELF") || bytes.starts_with(b"#!")
+}
+
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+/// Depth-first search for a file literally named `Dockerfile`, checking
+/// each directory's own files before descending (matches the common case
+/// of it sitting at the extracted folder's top level).
+fn find_dockerfile(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().is_some_and(|n| n == "Dockerfile") {
+            return Some(path);
+        }
+        if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    subdirs.into_iter().find_map(|d| find_dockerfile(&d))
+}
+
+fn build_and_run_docker(dockerfile: &std::path::Path, challenge_id: i64, title: &str) -> Result<()> {
+    let build_context = dockerfile
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Dockerfile has no parent directory"))?;
+
+    if std::process::Command::new("docker")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!(
+            "{}",
+            "Dockerfile found but 'docker' isn't installed - skipping container build.".yellow()
+        );
+        return Ok(());
+    }
+
+    let tag = docker_tag_for_challenge(challenge_id, title);
+
+    println!("\nDockerfile found - building image '{}'...", tag);
+    let build_status = std::process::Command::new("docker")
+        .args(["build", "-t", &tag, "."])
+        .current_dir(build_context)
+        .status()?;
+    if !build_status.success() {
+        return Err(anyhow::anyhow!("docker build exited with {}", build_status));
+    }
+
+    // Ignore failures here - there's just nothing to remove on a first run.
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", &tag])
+        .output();
+
+    println!("Starting container '{}'...", tag);
+    let run_status = std::process::Command::new("docker")
+        .args(["run", "-d", "-P", "--name", &tag, &tag])
+        .status()?;
+    if !run_status.success() {
+        return Err(anyhow::anyhow!("docker run exited with {}", run_status));
+    }
+
+    let ports = std::process::Command::new("docker")
+        .args(["port", &tag])
+        .output()?;
+    let ports = String::from_utf8_lossy(&ports.stdout);
+
+    println!("{}", format!("✓ Container '{}' is running", tag).green().bold());
+    if ports.trim().is_empty() {
+        println!("  (no ports exposed)");
+    } else {
+        for line in ports.lines() {
+            println!("  {}", line);
+        }
+    }
+
+    Ok(())
+}
+
+/// Docker image/container names must be lowercase alphanumerics plus
+/// `.`/`_`/`-`.
+fn docker_slug(name: &str) -> String {
+    let lower: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .collect();
+    lower.trim_matches(|c: char| matches!(c, '-' | '.' | '_')).to_string()
+}
+
+/// Derived from `challenge_id` (not the local download folder name, which
+/// `--output` can override) so `lucid submit` can independently recompute
+/// the same tag later to tear the container down, without needing to know
+/// where - or under what name - it was downloaded to. Prefixed with
+/// `lucid-` to namespace what this tool creates (`docker ps --filter
+/// name=lucid-`).
+fn docker_tag_for_challenge(challenge_id: i64, title: &str) -> String {
+    let slug = docker_slug(title);
+    if slug.is_empty() {
+        format!("lucid-{challenge_id}")
+    } else {
+        format!("lucid-{challenge_id}-{slug}")
+    }
 }
 
 /// The challenge's own `description` is already markdown (confirmed via

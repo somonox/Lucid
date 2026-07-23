@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::config::{get_session, get_csrf_token};
 
 const DREAMHACK_BASE_URL: &str = "https://dreamhack.io";
@@ -435,4 +435,55 @@ pub async fn download_challenge(challenge_id: i64) -> Result<Vec<u8>> {
     }
 
     Ok(file_response.bytes().await?.to_vec())
+}
+
+#[derive(Debug, Serialize)]
+struct FlagSubmission<'a> {
+    flag: &'a str,
+}
+
+// Real behavior confirmed via curl against the live API:
+// POST /api/v1/wargame/challenges/{id}/auth/ {"flag": "..."} requires
+// session + X-CSRFToken like download. A wrong flag comes back as DRF's
+// standard field-error shape: 400 {"flag": ["Wrong flag."]}. The success
+// shape wasn't verified (would require actually solving a challenge to
+// check), so success is judged purely by HTTP status - any 2xx is treated
+// as correct.
+#[derive(Debug, Deserialize)]
+struct FlagErrorDetail {
+    flag: Option<Vec<String>>,
+    detail: Option<String>,
+}
+
+pub async fn submit_flag(challenge_id: i64, flag: &str) -> Result<()> {
+    let session = get_session()?
+        .ok_or_else(|| anyhow!("Not logged in. Please run 'lucid login' first."))?;
+    let csrf_token = get_csrf_token()?
+        .ok_or_else(|| anyhow!("No CSRF token saved. Please run 'lucid login' again."))?;
+
+    let client = client()?;
+    let response = client
+        .post(format!(
+            "{}/api/v1/wargame/challenges/{}/auth/",
+            DREAMHACK_BASE_URL, challenge_id
+        ))
+        .header("Accept", "application/json")
+        .header("Cookie", &session)
+        .header("X-CSRFToken", &csrf_token)
+        .json(&FlagSubmission { flag })
+        .send()
+        .await?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let message = response
+        .json::<FlagErrorDetail>()
+        .await
+        .ok()
+        .and_then(|e| e.flag.map(|v| v.join(" ")).or(e.detail))
+        .unwrap_or_else(|| status.to_string());
+    Err(anyhow!("{message}"))
 }
