@@ -487,3 +487,156 @@ pub async fn submit_flag(challenge_id: i64, flag: &str) -> Result<()> {
         .unwrap_or_else(|| status.to_string());
     Err(anyhow!("{message}"))
 }
+
+// Real schema confirmed against the live API (vm_gen.har + follow-up
+// read-only/teardown curl checks - no VM was ever created by this
+// exploration, only inspected/torn down, so no credits were spent
+// verifying this):
+// GET /api/v1/user/vm-credits/ -> {"balance": N, "has_unlimited_credits": bool}
+#[derive(Debug, Deserialize)]
+pub struct VmCredits {
+    pub balance: i64,
+    pub has_unlimited_credits: bool,
+}
+
+pub async fn get_vm_credits() -> Result<VmCredits> {
+    let session = get_session()?
+        .ok_or_else(|| anyhow!("Not logged in. Please run 'lucid login' first."))?;
+    let csrf_token = get_csrf_token()?.unwrap_or_default();
+
+    let client = client()?;
+    let response = client
+        .get(format!("{}/api/v1/user/vm-credits/", DREAMHACK_BASE_URL))
+        .header("Accept", "application/json")
+        .header("Cookie", &session)
+        .header("X-CSRFToken", &csrf_token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Failed to get VM credits: {}", response.status()));
+    }
+
+    Ok(response.json().await?)
+}
+
+// GET /api/v1/wargame/challenges/{id}/live/ -> full status object if a VM
+// is running, or a bare `{}` if not (confirmed via curl after tearing one
+// down) - so an empty object means "no VM", not an error.
+#[derive(Debug, Deserialize)]
+pub struct VmStatus {
+    pub id: String,
+    pub state: String,
+    pub host: String,
+    pub starttime: String,
+    pub endtime: String,
+    /// Each entry is (protocol, port, port) exactly as the API returns it -
+    /// which number is the externally-reachable one wasn't confirmed, so
+    /// it's left unlabeled rather than guessed at.
+    pub port_mappings: Vec<(String, i32, i32)>,
+}
+
+pub async fn get_vm_status(challenge_id: i64) -> Result<Option<VmStatus>> {
+    let session = get_session()?
+        .ok_or_else(|| anyhow!("Not logged in. Please run 'lucid login' first."))?;
+    let csrf_token = get_csrf_token()?.unwrap_or_default();
+
+    let client = client()?;
+    let response = client
+        .get(format!(
+            "{}/api/v1/wargame/challenges/{}/live/",
+            DREAMHACK_BASE_URL, challenge_id
+        ))
+        .header("Accept", "application/json")
+        .header("Cookie", &session)
+        .header("X-CSRFToken", &csrf_token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Failed to get VM status: {}", response.status()));
+    }
+
+    // Confirmed via curl: challenges with no VM feature at all (e.g. a
+    // plain reversing challenge, not needs_vm) return 200 with a
+    // completely empty body here - not even `{}` - which isn't valid JSON
+    // on its own, so that has to be checked before attempting to parse.
+    let text = response.text().await?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    if value.as_object().is_some_and(|o| o.is_empty()) {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(value)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct VmCreateResponse {
+    vmid: String,
+}
+
+/// Spins up a real remote VM and **spends one VM credit** (confirmed via
+/// vm_gen.har: POST returns 201 `{"vmid": "..."}`, and the account's
+/// vm-credits balance is what it's billed against). Only call this in
+/// direct response to an explicit user request - never speculatively, and
+/// never from a test/verification path.
+pub async fn create_vm(challenge_id: i64) -> Result<String> {
+    let session = get_session()?
+        .ok_or_else(|| anyhow!("Not logged in. Please run 'lucid login' first."))?;
+    let csrf_token = get_csrf_token()?
+        .ok_or_else(|| anyhow!("No CSRF token saved. Please run 'lucid login' again."))?;
+
+    let client = client()?;
+    let response = client
+        .post(format!(
+            "{}/api/v1/wargame/challenges/{}/live/",
+            DREAMHACK_BASE_URL, challenge_id
+        ))
+        .header("Accept", "application/json")
+        .header("Cookie", &session)
+        .header("X-CSRFToken", &csrf_token)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .json::<ErrorDetail>()
+            .await
+            .map(|e| e.detail)
+            .unwrap_or_else(|_| status.to_string());
+        return Err(anyhow!("Failed to start VM: {detail}"));
+    }
+
+    Ok(response.json::<VmCreateResponse>().await?.vmid)
+}
+
+// DELETE /api/v1/wargame/challenges/{id}/live/ -> 204, confirmed free
+// (tearing down doesn't cost a credit - only creating does).
+pub async fn stop_vm(challenge_id: i64) -> Result<()> {
+    let session = get_session()?
+        .ok_or_else(|| anyhow!("Not logged in. Please run 'lucid login' first."))?;
+    let csrf_token = get_csrf_token()?
+        .ok_or_else(|| anyhow!("No CSRF token saved. Please run 'lucid login' again."))?;
+
+    let client = client()?;
+    let response = client
+        .delete(format!(
+            "{}/api/v1/wargame/challenges/{}/live/",
+            DREAMHACK_BASE_URL, challenge_id
+        ))
+        .header("Accept", "application/json")
+        .header("Cookie", &session)
+        .header("X-CSRFToken", &csrf_token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Failed to stop VM: {}", response.status()));
+    }
+
+    Ok(())
+}

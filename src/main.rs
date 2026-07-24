@@ -53,8 +53,37 @@ enum Commands {
     /// Submit a flag for a challenge (requires login). Stops any container
     /// 'lucid download' started for it if the flag is correct.
     Submit {
-        challenge_id: i64,
         flag: String,
+        #[arg(short, long, help = "Challenge id (defaults to the one 'lucid download' recorded in this folder)")]
+        id: Option<i64>,
+    },
+    /// Manage remote VM instances for challenges that need one (requires login)
+    Vm {
+        #[command(subcommand)]
+        action: VmAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmAction {
+    /// Show your remaining VM credit balance
+    Credits,
+    /// Check whether a VM is currently running for a challenge
+    Status {
+        #[arg(short, long, help = "Challenge id (defaults to the one 'lucid download' recorded in this folder)")]
+        id: Option<i64>,
+    },
+    /// Start a remote VM for a challenge - costs 1 VM credit, asks to confirm first
+    Start {
+        #[arg(short, long, help = "Challenge id (defaults to the one 'lucid download' recorded in this folder)")]
+        id: Option<i64>,
+        #[arg(short, long, help = "Skip the confirmation prompt")]
+        yes: bool,
+    },
+    /// Stop the running VM for a challenge
+    Stop {
+        #[arg(short, long, help = "Challenge id (defaults to the one 'lucid download' recorded in this folder)")]
+        id: Option<i64>,
     },
 }
 
@@ -89,10 +118,95 @@ async fn main() -> Result<()> {
         Commands::Class { category } => {
             print_class(&category).await?;
         }
-        Commands::Submit { challenge_id, flag } => {
-            submit_flag(challenge_id, &flag).await?;
+        Commands::Submit { flag, id } => {
+            submit_flag(resolve_challenge_id(id)?, &flag).await?;
+        }
+        Commands::Vm { action } => match action {
+            VmAction::Credits => print_vm_credits().await?,
+            VmAction::Status { id } => print_vm_status(resolve_challenge_id(id)?).await?,
+            VmAction::Start { id, yes } => start_vm(resolve_challenge_id(id)?, yes).await?,
+            VmAction::Stop { id } => {
+                let challenge_id = resolve_challenge_id(id)?;
+                api::stop_vm(challenge_id).await?;
+                println!("{}", format!("✓ Stopped VM for challenge #{}", challenge_id).green().bold());
+            }
+        },
+    }
+
+    Ok(())
+}
+
+async fn print_vm_credits() -> Result<()> {
+    let credits = api::get_vm_credits().await?;
+    if credits.has_unlimited_credits {
+        println!("{}", "Unlimited VM credits".green().bold());
+    } else {
+        println!("VM credits remaining: {}", credits.balance);
+    }
+    Ok(())
+}
+
+async fn print_vm_status(challenge_id: i64) -> Result<()> {
+    match api::get_vm_status(challenge_id).await? {
+        None => println!("No VM is currently running for challenge #{}.", challenge_id),
+        Some(vm) => {
+            println!(
+                "{}",
+                format!("VM for challenge #{} - {}", challenge_id, vm.state).cyan().bold()
+            );
+            println!("  Host: {}", vm.host);
+            for (proto, a, b) in &vm.port_mappings {
+                println!("  {} {} <-> {}", proto, a, b);
+            }
+            println!("  Started: {}", vm.starttime);
+            println!("  Expires: {}", vm.endtime);
         }
     }
+    Ok(())
+}
+
+async fn start_vm(challenge_id: i64, skip_confirm: bool) -> Result<()> {
+    let credits = api::get_vm_credits().await?;
+    if !credits.has_unlimited_credits && credits.balance <= 0 {
+        return Err(anyhow::anyhow!("No VM credits left."));
+    }
+
+    // Avoid accidentally spending a credit on a second VM for a challenge
+    // that already has one running.
+    if let Some(existing) = api::get_vm_status(challenge_id).await? {
+        println!(
+            "{}",
+            format!(
+                "A VM is already running for challenge #{} ({}) - not starting another.",
+                challenge_id, existing.state
+            )
+            .yellow()
+        );
+        return Ok(());
+    }
+
+    if !skip_confirm {
+        let prompt = if credits.has_unlimited_credits {
+            format!("Start a VM for challenge #{}?", challenge_id)
+        } else {
+            format!(
+                "Start a VM for challenge #{}? This uses 1 of your {} remaining VM credits.",
+                challenge_id, credits.balance
+            )
+        };
+        let confirmed = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(prompt)
+            .default(false)
+            .interact()?;
+        if !confirmed {
+            println!("Cancelled - no credit spent.");
+            return Ok(());
+        }
+    }
+
+    let vmid = api::create_vm(challenge_id).await?;
+    println!("{}", format!("✓ VM starting (id: {})", vmid).green().bold());
+    println!("Run `lucid vm status {}` in a moment for connection details.", challenge_id);
 
     Ok(())
 }
@@ -209,6 +323,7 @@ async fn download_challenge(challenge_id: i64, output: Option<&str>) -> Result<(
     let folder = std::path::Path::new(&folder_name);
     std::fs::create_dir_all(folder)?;
 
+    let mut elf_paths = Vec::new();
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))?;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
@@ -237,9 +352,17 @@ async fn download_challenge(challenge_id: i64, output: Option<&str>) -> Result<(
         if is_executable(&contents) {
             make_executable(&out_path)?;
         }
+        if is_elf(&contents) {
+            elf_paths.push(out_path);
+        }
     }
 
-    std::fs::write(folder.join("README.md"), challenge_readme(&challenge))?;
+    let mut readme = challenge_readme(&challenge);
+    if let Some(section) = checksec_section(folder, &elf_paths) {
+        readme.push_str(&section);
+    }
+    std::fs::write(folder.join("README.md"), readme)?;
+    write_challenge_meta(folder, challenge.id, &challenge.title)?;
 
     println!(
         "{}",
@@ -260,8 +383,97 @@ async fn download_challenge(challenge_id: i64, output: Option<&str>) -> Result<(
     Ok(())
 }
 
+const CHALLENGE_META_FILENAME: &str = ".lucid.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ChallengeMeta {
+    challenge_id: i64,
+    title: String,
+}
+
+fn write_challenge_meta(folder: &std::path::Path, challenge_id: i64, title: &str) -> Result<()> {
+    let meta = ChallengeMeta { challenge_id, title: title.to_string() };
+    std::fs::write(folder.join(CHALLENGE_META_FILENAME), serde_json::to_string_pretty(&meta)?)?;
+    Ok(())
+}
+
+/// Walks up from the current directory looking for `.lucid.json`, the same
+/// way `git` locates `.git` - so `submit`/`vm` can be run from inside (or
+/// below) a folder `download` created without repeating the challenge id.
+fn find_challenge_meta() -> Option<ChallengeMeta> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(CHALLENGE_META_FILENAME);
+        if candidate.is_file() {
+            if let Ok(text) = std::fs::read_to_string(&candidate) {
+                if let Ok(meta) = serde_json::from_str(&text) {
+                    return Some(meta);
+                }
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn resolve_challenge_id(explicit: Option<i64>) -> Result<i64> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
+    find_challenge_meta().map(|m| m.challenge_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No --id given and no {} found in this directory or its parents. \
+             Run this from inside a folder 'lucid download' created, or pass --id explicitly.",
+            CHALLENGE_META_FILENAME
+        )
+    })
+}
+
 fn is_executable(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x7fELF") || bytes.starts_with(b"#!")
+}
+
+fn is_elf(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x7fELF")
+}
+
+/// Runs `checksec --file=<path>` (pwntools' console-script, confirmed via
+/// its plain-text table output: RELRO/Stack/NX/PIE/...) on every extracted
+/// ELF and bundles the results into a markdown section. Returns None
+/// (rather than an empty section) if checksec isn't installed or every
+/// invocation failed, so callers don't append a heading with nothing under
+/// it.
+fn checksec_section(folder: &std::path::Path, elf_paths: &[std::path::PathBuf]) -> Option<String> {
+    let mut section = String::from("\n## checksec\n");
+    let mut ran_any = false;
+
+    for path in elf_paths {
+        let Ok(output) = std::process::Command::new("checksec")
+            .arg(format!("--file={}", path.display()))
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        ran_any = true;
+        let relative = path.strip_prefix(folder).unwrap_or(path);
+        // pwntools' `checksec` console-script logs its table to stderr, not
+        // stdout (confirmed: stdout came back empty, stderr had it) - other
+        // checksec implementations may use stdout instead, so combine both
+        // rather than assume one.
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        section.push_str(&format!("\n### {}\n\n```\n{}\n```\n", relative.display(), text.trim()));
+    }
+
+    ran_any.then_some(section)
 }
 
 #[cfg(unix)]
